@@ -168,7 +168,7 @@ export async function initRenderPipeline(kibanaUrl: string): Promise<void> {
       zoom: 2,
     },
     poolSize: 1,
-    service: { enabled: false, url: undefined, mode: 'async' },
+    service: { enabled: false, url: undefined, mode: 'async', apiKey: undefined },
   });
 
   const driverFactory = new HeadlessChromiumDriverFactory(

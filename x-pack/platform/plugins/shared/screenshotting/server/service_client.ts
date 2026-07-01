@@ -78,11 +78,12 @@ function httpRequest(
 }
 
 function httpGetBuffer(
-  url: string
+  url: string,
+  headers: Record<string, string> = {}
 ): Promise<{ status: number; buffer: Buffer; contentType: string }> {
   return new Promise((resolve, reject) => {
     const lib = url.startsWith('https') ? https : http;
-    const req = lib.get(url, (res) => {
+    const req = lib.get(url, { headers }, (res) => {
       const chunks: Buffer[] = [];
       res.on('data', (chunk) => chunks.push(chunk));
       res.on('end', () =>
@@ -159,8 +160,17 @@ export class ServiceScreenshotClient {
   constructor(
     private readonly serviceUrl: string,
     private readonly mode: 'sync' | 'async',
-    private readonly logger: Logger
+    private readonly logger: Logger,
+    private readonly apiKey?: string
   ) {}
+
+  /**
+   * Auth header sent to the reporting service. The service reuses this same key
+   * to read/write the rendered artifact in Elasticsearch (result-storage "A").
+   */
+  private authHeaders(): Record<string, string> {
+    return this.apiKey ? { Authorization: `ApiKey ${this.apiKey}` } : {};
+  }
 
   getScreenshots(options: ScreenshotOptions): Observable<ScreenshotResult> {
     return from(this.renderViaService(options));
@@ -204,7 +214,11 @@ export class ServiceScreenshotClient {
 
     const response = await httpPostBinary(
       url,
-      { 'Content-Type': 'application/json', 'Content-Length': String(Buffer.byteLength(body)) },
+      {
+        'Content-Type': 'application/json',
+        'Content-Length': String(Buffer.byteLength(body)),
+        ...this.authHeaders(),
+      },
       body
     );
 
@@ -241,6 +255,7 @@ export class ServiceScreenshotClient {
         headers: {
           'Content-Type': 'application/json',
           'Content-Length': String(Buffer.byteLength(body)),
+          ...this.authHeaders(),
         },
       },
       body
@@ -270,7 +285,10 @@ export class ServiceScreenshotClient {
     while (Date.now() < deadline) {
       await sleep(ASYNC_POLL_INTERVAL_MS);
 
-      const statusResp = await httpRequest(pollUrl, { method: 'GET' });
+      const statusResp = await httpRequest(pollUrl, {
+        method: 'GET',
+        headers: this.authHeaders(),
+      });
       if (statusResp.status !== 200) {
         throw new Error(`Status poll error ${statusResp.status}: ${statusResp.body}`);
       }
@@ -290,7 +308,7 @@ export class ServiceScreenshotClient {
         const artifactUrl = `${this.serviceUrl}/api/v1/jobs/${jobId}/artifact`;
         this.logger.info(`[service-client] Job ${jobId} complete — downloading artifact`);
 
-        const { buffer, contentType } = await httpGetBuffer(artifactUrl);
+        const { buffer, contentType } = await httpGetBuffer(artifactUrl, this.authHeaders());
         this.logger.info(`[service-client] Artifact downloaded: ${buffer.length} bytes`);
 
         return buildResult(buffer, contentType, format);

@@ -110,7 +110,8 @@ export class ScreenshottingPlugin implements Plugin<void, ScreenshottingStart, S
       const serviceClient = new ServiceScreenshotClient(
         service.url,
         service.mode ?? 'async',
-        this.logger.get('service-client')
+        this.logger.get('service-client'),
+        service.apiKey
       );
       this.logger.info(
         `[reporting-service-poc] Remote reporting service ENABLED. ` +

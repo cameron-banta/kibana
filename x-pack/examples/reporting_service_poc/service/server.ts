@@ -6,32 +6,43 @@
  */
 
 /**
- * Standalone Reporting Service HTTP server.
+ * Reporting API service — the router tier (Layer 2 of the POC topology).
  *
- * Implements the HTTP API described in Mike Cote's multi-tenant reporting service proposal.
- * Exposes both a synchronous and an async endpoint so the team can evaluate both patterns.
+ * Sits between Kibana and the render workers. It owns admission control
+ * (concurrency + bounded queue + 429), routes each accepted render to a worker
+ * over HTTP, and exposes a /metrics gauge for autoscaling. It does NOT run
+ * Chromium and does NOT hold artifact bytes: workers write results to
+ * Elasticsearch, and this tier reads them back from ES to serve downloads.
  *
  * Routes (all under /api/v1):
  *   GET  /health           — liveness probe
- *   GET  /version          — API version + Chromium info
+ *   GET  /version          — API version
+ *   GET  /metrics          — live gauge for HPA/KEDA (active renders, queue depth, 429s)
  *   POST /screenshot       — synchronous: blocks until artifact is ready, returns bytes
  *   POST /jobs             — async: returns 202 + jobId immediately
  *   GET  /jobs/:id         — poll job status
- *   GET  /jobs/:id/artifact — download artifact bytes (when status = completed)
+ *   GET  /jobs/:id/artifact — download artifact bytes (read from ES) when completed
  */
 
 import http from 'http';
-import type { RenderRequest } from './types';
+import type { RenderRequest, WorkerRenderRequest, WorkerRenderResponse } from './types';
 import type { RenderQueue } from './queue';
-import { render } from './render_pipeline';
+import type { WorkerPool } from './worker_pool';
+import { readResult } from './es_client';
 
 const SERVICE_API_VERSION = '1.0.0-poc';
 
-/** Simple logger backed by process.stdout/stderr (service is a standalone Node.js script). */
 const svcLog = {
   info: (msg: string) => process.stdout.write(`[INFO][service] ${msg}\n`),
   error: (msg: string | Error) => process.stderr.write(`[ERROR][service] ${String(msg)}\n`),
 };
+
+export interface RouterConfig {
+  esUrl: string;
+  resultIndex: string;
+  /** Fallback Authorization header for ES reads when the request carries none. */
+  fallbackEsAuthorization?: string;
+}
 
 function parseBody(req: http.IncomingMessage): Promise<unknown> {
   return new Promise((resolve, reject) => {
@@ -114,15 +125,90 @@ function validateRenderRequest(body: unknown): RenderRequest {
   };
 }
 
-export function createServer(queue: RenderQueue): http.Server {
+/** POST JSON to a worker and parse the JSON response. */
+function postJson(
+  url: string,
+  payload: unknown
+): Promise<{ status: number; body: WorkerRenderResponse }> {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url);
+    const json = JSON.stringify(payload);
+    const req = http.request(
+      {
+        method: 'POST',
+        hostname: parsed.hostname,
+        port: parsed.port,
+        path: parsed.pathname + parsed.search,
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(json),
+        },
+      },
+      (res) => {
+        let data = '';
+        res.on('data', (chunk) => {
+          data += chunk;
+        });
+        res.on('end', () => {
+          try {
+            resolve({
+              status: res.statusCode ?? 0,
+              body: JSON.parse(data) as WorkerRenderResponse,
+            });
+          } catch {
+            reject(new Error(`Worker returned non-JSON response (${res.statusCode}): ${data}`));
+          }
+        });
+      }
+    );
+    req.on('error', reject);
+    req.write(json);
+    req.end();
+  });
+}
+
+export function createServer(
+  queue: RenderQueue,
+  pool: WorkerPool,
+  config: RouterConfig
+): http.Server {
+  const { esUrl, resultIndex, fallbackEsAuthorization } = config;
+
+  /** Dispatch one render to the least-busy worker; resolves once ES has the result. */
+  const dispatchToWorker = async (
+    jobId: string,
+    request: RenderRequest,
+    authorization?: string
+  ): Promise<{ contentType: string }> => {
+    const workerUrl = pool.pick();
+    pool.markBusy(workerUrl);
+    try {
+      const workerRequest: WorkerRenderRequest = {
+        jobId,
+        request,
+        esUrl,
+        resultIndex,
+        authorization: authorization ?? fallbackEsAuthorization,
+      };
+      const { status, body } = await postJson(`${workerUrl}/api/v1/render`, workerRequest);
+      if (status !== 200 || !body.ok) {
+        throw new Error(body?.error ?? `Worker render failed with status ${status}`);
+      }
+      return { contentType: body.contentType };
+    } finally {
+      pool.markFree(workerUrl);
+    }
+  };
+
   const server = http.createServer(async (req, res) => {
-    const url = new URL(req.url ?? '/', `http://localhost`);
+    const url = new URL(req.url ?? '/', 'http://localhost');
     const path = url.pathname.replace(/\/$/, '');
+    const authorization = req.headers.authorization ?? fallbackEsAuthorization;
 
     try {
       // ── GET /api/v1/health ───────────────────────────────────────────
       if (req.method === 'GET' && path === '/api/v1/health') {
-        send(res, 200, { status: 'ok', apiVersion: SERVICE_API_VERSION });
+        send(res, 200, { status: 'ok', role: 'api', apiVersion: SERVICE_API_VERSION });
         return;
       }
 
@@ -130,14 +216,21 @@ export function createServer(queue: RenderQueue): http.Server {
       if (req.method === 'GET' && path === '/api/v1/version') {
         send(res, 200, {
           apiVersion: SERVICE_API_VERSION,
-          description: 'Multi-tenant Reporting Service POC — Mike Cote proposal',
+          description: 'Multi-tenant Reporting Service POC — API/router tier',
         });
+        return;
+      }
+
+      // ── GET /api/v1/metrics (autoscaling gauge) ──────────────────────
+      if (req.method === 'GET' && path === '/api/v1/metrics') {
+        send(res, 200, queue.metrics(pool.snapshot()));
         return;
       }
 
       // ── POST /api/v1/screenshot (sync) ───────────────────────────────
       if (req.method === 'POST' && path === '/api/v1/screenshot') {
         if (queue.isAtCapacity) {
+          queue.record429();
           send(
             res,
             429,
@@ -147,28 +240,30 @@ export function createServer(queue: RenderQueue): http.Server {
           return;
         }
 
-        const body = await parseBody(req);
-        const renderReq = validateRenderRequest(body);
-
+        const renderReq = validateRenderRequest(await parseBody(req));
         svcLog.info(`sync render: format=${renderReq.format} urls=${renderReq.urls.length}`);
 
         const job = queue.createJob();
-        await queue.run(job, () => render(renderReq));
+        await queue.run(job, () => dispatchToWorker(job.id, renderReq, authorization));
 
         if (job.status === 'failed') {
           send(res, 500, { error: job.error ?? 'Render failed' });
           return;
         }
 
-        const data = Buffer.from(job.resultBase64!, 'base64');
-        const contentType = renderReq.format === 'pdf' ? 'application/pdf' : 'image/png';
-        sendBinary(res, 200, contentType, data);
+        const result = await readResult({ esUrl, index: resultIndex, id: job.id, authorization });
+        if (!result) {
+          send(res, 500, { error: 'Result not found in Elasticsearch after render' });
+          return;
+        }
+        sendBinary(res, 200, result.contentType, result.data);
         return;
       }
 
       // ── POST /api/v1/jobs (async submit) ─────────────────────────────
       if (req.method === 'POST' && path === '/api/v1/jobs') {
         if (queue.isAtCapacity) {
+          queue.record429();
           send(
             res,
             429,
@@ -178,18 +273,15 @@ export function createServer(queue: RenderQueue): http.Server {
           return;
         }
 
-        const body = await parseBody(req);
-        const renderReq = validateRenderRequest(body);
-
+        const renderReq = validateRenderRequest(await parseBody(req));
         const job = queue.createJob();
         svcLog.info(`async job queued: id=${job.id} format=${renderReq.format}`);
 
-        // Fire-and-forget: let queue.run() update job.status as it goes.
+        // Fire-and-forget: queue.run() updates job.status; the worker writes the
+        // result to ES. The download route reads it back from ES.
         queue
-          .run(job, () => render(renderReq))
-          .catch((err: Error) => {
-            svcLog.error(`job ${job.id} error: ${err.message}`);
-          });
+          .run(job, () => dispatchToWorker(job.id, renderReq, authorization))
+          .catch((err: Error) => svcLog.error(`job ${job.id} error: ${err.message}`));
 
         send(res, 202, { jobId: job.id, status: job.status });
         return;
@@ -214,7 +306,7 @@ export function createServer(queue: RenderQueue): http.Server {
         return;
       }
 
-      // ── GET /api/v1/jobs/:id/artifact ────────────────────────────────
+      // ── GET /api/v1/jobs/:id/artifact (read from ES) ─────────────────
       const artifactMatch = path.match(/^\/api\/v1\/jobs\/([^/]+)\/artifact$/);
       if (req.method === 'GET' && artifactMatch) {
         const job = queue.getJob(artifactMatch[1]);
@@ -226,12 +318,17 @@ export function createServer(queue: RenderQueue): http.Server {
           send(res, 409, { error: 'Job not yet completed', status: job.status });
           return;
         }
-        // We don't store the original format in the job for simplicity — derive from
-        // resultBase64 magic bytes. PNG starts with \x89PNG; PDF starts with %PDF.
-        const data = Buffer.from(job.resultBase64!, 'base64');
-        const isPdf = data[0] === 0x25 && data[1] === 0x50; // %P
-        const contentType = isPdf ? 'application/pdf' : 'image/png';
-        sendBinary(res, 200, contentType, data);
+        const result = await readResult({
+          esUrl,
+          index: resultIndex,
+          id: job.id,
+          authorization,
+        });
+        if (!result) {
+          send(res, 404, { error: 'Artifact not found in Elasticsearch' });
+          return;
+        }
+        sendBinary(res, 200, result.contentType, result.data);
         return;
       }
 
@@ -242,9 +339,7 @@ export function createServer(queue: RenderQueue): http.Server {
       send(
         res,
         err instanceof SyntaxError || (err as Error).message?.includes('Invalid JSON') ? 400 : 500,
-        {
-          error: err instanceof Error ? err.message : String(err),
-        }
+        { error: err instanceof Error ? err.message : String(err) }
       );
     }
   });

@@ -14,11 +14,14 @@ Stateless code pertaining to the capture of screenshots for Kibana Reporting.
 This package is the natural seam for the reporting-service work because it already owns the
 stateless screenshot-capture concerns (Chromium config, args, binary paths). The POC adds a
 config-gated path that makes Kibana call an **external HTTP service** to render reports instead
-of launching Chromium in-process.
+of launching Chromium in-process. The service is split into a **three-tier topology** — Kibana →
+an **API/router tier** → one or more **render workers** — with rendered artifacts persisted to
+**Elasticsearch** (never held in service memory).
 
 ## Contents
 
 - [Background: Mike Cote's proposal](#background-mike-cotes-proposal)
+- [Architecture (three tiers)](#architecture-three-tiers)
 - [What this POC does](#what-this-poc-does)
 - [How to run the POC](#how-to-run-the-poc)
 - [What works / what doesn't](#what-works--what-doesnt)
@@ -92,6 +95,36 @@ Kibana (reporting task)
 
 ---
 
+## Architecture (three tiers)
+
+The POC models the topology Mike's doc describes: a lightweight API tier in front of a pool of
+render workers, with artifacts persisted to Elasticsearch.
+
+```
+┌────────────┐   HTTP (Authorization: ApiKey)   ┌──────────────────┐   HTTP    ┌───────────────┐
+│  Kibana    │ ───────────────────────────────► │  API / router    │ ────────► │  Worker(s)    │
+│ (reporting │  serialized render request       │  tier            │  /render  │  own Chromium │
+│  task)     │ ◄─────────────────────────────── │  • admission     │           │  + render     │
+└────────────┘   artifact bytes (read from ES)  │    control (429) │           │    pipeline   │
+                                                 │  • routes to     │           └──────┬────────┘
+                                                 │    workers       │                  │ writes result
+                                                 │  • /metrics      │                  ▼
+                                                 │  • NO Chromium   │           ┌───────────────┐
+                                                 └────────┬─────────┘           │ Elasticsearch │
+                                                          └────── reads ───────►│  result index │
+                                                             artifact           └───────────────┘
+```
+
+- **Tier 1 — Kibana:** unchanged reporting path; a config-gated client forwards the render request.
+- **Tier 2 — API / router:** admission control (concurrency + bounded queue + `429`), routes each
+  accepted render to the least-busy worker, exposes a `/metrics` gauge for autoscaling, and reads
+  finished artifacts back from ES to serve downloads. **Runs no Chromium and holds no artifact bytes.**
+- **Tier 3 — Worker:** owns Chromium + the render pipeline; writes the rendered artifact **straight
+  to Elasticsearch** under the job id, then returns only metadata.
+- **Elasticsearch:** the single result store (result-storage decision **A** — see [D6](#d6-result-storage-who-writes-to-es)).
+
+---
+
 ## What this POC does
 
 Reporting calls exactly one seam: `ScreenshottingStart.getScreenshots(options)` in
@@ -106,33 +139,51 @@ The POC:
    `src/config/schema.ts`):
    ```yaml
    xpack.screenshotting.service.enabled: false      # default OFF → zero behavior change
-   xpack.screenshotting.service.url: http://127.0.0.1:8790
+   xpack.screenshotting.service.url: http://127.0.0.1:8790   # the API/router tier
    xpack.screenshotting.service.mode: async         # 'sync' | 'async'
+   xpack.screenshotting.service.apiKey: <encoded>   # ES API key: auth + reused for ES read/write
    ```
 2. **Config-gates the seam** in `screenshotting/server/plugin.ts`: when enabled, `getScreenshots`
-   is backed by a new `ServiceScreenshotClient` (serializes options + auth headers → HTTP,
-   adapts the returned bytes back into the exact `ScreenshotResult` reporting expects, surfaces
-   `429` as a retryable error). When disabled, the original in-process Chromium path is used.
+   is backed by a new `ServiceScreenshotClient` (serializes options + auth headers → HTTP, sends
+   the `apiKey` as `Authorization: ApiKey …`, adapts the returned bytes back into the exact
+   `ScreenshotResult` reporting expects, surfaces `429` as a retryable error). When disabled, the
+   original in-process Chromium path is used.
    **No change to reporting, Task Manager, `Screenshots`, or `HeadlessChromiumDriver`.**
-3. **Ships a standalone service** under `x-pack/examples/reporting_service_poc/` that **reuses
-   Kibana's own render pipeline** (`Screenshots` + `HeadlessChromiumDriverFactory`) so rendering
-   fidelity is identical, with a semaphore + bounded queue + `429`, plus sync and async
-   (submit / poll / download) endpoints, and health/version routes.
+3. **Ships a standalone service** under `x-pack/examples/reporting_service_poc/`, split into an
+   **API/router process** (`scripts/start_service.js`) and a **worker process**
+   (`scripts/start_worker.js`). The worker **reuses Kibana's own render pipeline**
+   (`Screenshots` + `HeadlessChromiumDriverFactory`) so rendering fidelity is identical.
+4. **Persists results to Elasticsearch** — the worker reuses the API key to write the artifact to
+   an ES index; the router reads it back for downloads. **No artifact bytes ever live in service
+   memory** (result-storage decision **A**).
+5. **Exposes `/metrics`** on the router (active renders, queue depth, `429` count, per-worker
+   in-flight) as the autoscaling signal (decision **1** — see [D10](#d10-autoscaling-signal)).
 
-> ⚠️ **How the service gets the render pipeline today:** it imports Kibana's plugin-internal
+> ⚠️ **How the worker gets the render pipeline today:** it imports Kibana's plugin-internal
 > modules directly (via `@kbn/setup-node-env`) from the same source tree. This is the single
 > biggest "not production-ready" shortcut — see [decision D1](#d1-how-does-the-service-get-the-render-pipeline).
 
 ### HTTP API (v1)
 
+**API / router tier** (what Kibana calls, base `http://127.0.0.1:8790`):
+
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/api/v1/health` | Liveness |
 | `GET` | `/api/v1/version` | API version |
-| `POST` | `/api/v1/screenshot` | **Sync** — blocks, returns artifact bytes |
+| `GET` | `/api/v1/metrics` | Live gauge for autoscaling (active, queued, `429`s, workers) |
+| `POST` | `/api/v1/screenshot` | **Sync** — blocks, returns artifact bytes (read from ES) |
 | `POST` | `/api/v1/jobs` | **Async** — `202 {jobId}` |
 | `GET` | `/api/v1/jobs/:id` | Poll status |
-| `GET` | `/api/v1/jobs/:id/artifact` | Download bytes when `completed` |
+| `GET` | `/api/v1/jobs/:id/artifact` | Download bytes (read from ES) when `completed` |
+
+**Worker tier** (called by the router, base `http://127.0.0.1:8791`):
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/api/v1/health` | Liveness |
+| `GET` | `/api/v1/metrics` | Per-worker active/total renders |
+| `POST` | `/api/v1/render` | Render one request + write the artifact to ES |
 
 Over capacity → `429 + Retry-After`; the Kibana client marks it retryable so Task Manager backs off.
 
@@ -140,7 +191,7 @@ Over capacity → `429 + Retry-After`; the Kibana client marks it retryable so T
 
 ## How to run the POC
 
-Three terminals.
+Four terminals (ES, the API/router tier, a worker, and Kibana).
 
 **Window 1 — Elasticsearch**
 
@@ -148,29 +199,52 @@ Three terminals.
 yarn es snapshot --license trial
 ```
 
-**Window 2 — the reporting service** (owns Chromium)
+**(Optional) create an ES API key** to exercise the `apiKey` path. Without it, the service falls
+back to `elastic:changeme` basic auth so it still runs:
+
+```bash
+curl -s -u elastic:changeme -X POST http://localhost:9200/_security/api_key \
+  -H 'Content-Type: application/json' -d '{"name":"reporting-poc"}' | jq -r .encoded
+# → copy the encoded value into --xpack.screenshotting.service.apiKey below
+```
+
+**Window 2 — the API / router tier** (no Chromium)
 
 ```bash
 node x-pack/examples/reporting_service_poc/scripts/start_service.js
-# options: --port 8790  --kibana-url http://localhost:5601  --concurrency 2  --queue-depth 10
+# options: --port 8790  --worker-url http://127.0.0.1:8791  --es-url http://localhost:9200
+#          --result-index reporting-service-poc-results  --concurrency 1  --queue-depth 10
 ```
 
-Wait for `✓ Reporting service listening on http://127.0.0.1:8790`.
+Wait for `✓ Reporting API service listening on http://127.0.0.1:8790`.
 
-**Window 3 — Kibana with service mode ON**
+**Window 3 — a render worker** (owns Chromium, writes results to ES)
+
+```bash
+node x-pack/examples/reporting_service_poc/scripts/start_worker.js
+# options: --port 8791  --kibana-url http://localhost:5601  --es-url http://localhost:9200
+#          --result-index reporting-service-poc-results
+```
+
+Wait for `✓ Reporting worker listening on http://127.0.0.1:8791`. (Run more workers on other ports
+and pass them all to the router with `--worker-url a,b,c` — bump `--concurrency` to match.)
+
+**Window 4 — Kibana with service mode ON**
 
 ```bash
 yarn start --run-examples --no-base-path \
   --xpack.screenshotting.service.enabled=true \
   --xpack.screenshotting.service.url=http://127.0.0.1:8790 \
-  --xpack.screenshotting.service.mode=async
+  --xpack.screenshotting.service.mode=async \
+  --xpack.screenshotting.service.apiKey=<encoded-key>   # optional; omit to use basic-auth fallback
 ```
 
 **Try it:** add the Flights sample data, open *[Flights] Global Flight Dashboard*,
-Share → Export → PNG or PDF. Window 3 logs the outbound service call; Window 2 logs the Chromium
-render. To prove the service is doing the work, kill Window 2 and regenerate (job fails with a
-connection error); restart it and it succeeds. Restart Kibana **without** the `service.*` flags to
-confirm the in-process fallback still works.
+Share → Export → PNG or PDF. Window 4 logs the outbound service call; Window 2 logs the dispatch to
+the worker; Window 3 logs the Chromium render and the ES write. Watch the queue live with
+`curl -s http://127.0.0.1:8790/api/v1/metrics | jq`. To prove the worker is doing the work, kill
+Window 3 and regenerate (job fails with a connection error); restart it and it succeeds. Restart
+Kibana **without** the `service.*` flags to confirm the in-process fallback still works.
 
 A more detailed runbook + curl examples live in
 `x-pack/examples/reporting_service_poc/README.md`.
@@ -184,6 +258,13 @@ A more detailed runbook + curl examples live in
 - **PNG export** (preserve layout).
 - **PDF export with "Optimize for printing" OFF** (preserve layout — screenshots assembled into a
   PDF by pdfmake on the Node side).
+- **Three-tier topology** — Kibana → API/router → worker, with the router dispatching to the
+  least-busy worker (run multiple workers and watch them balance).
+- **ES-backed result storage** — the worker writes the artifact to Elasticsearch; the router reads
+  it back for downloads. No artifact bytes in service memory.
+- **API-key reuse** — Kibana's `apiKey` authenticates the service call and is reused by the worker
+  to write the result to ES (with an `elastic:changeme` basic-auth fallback so it runs out of the box).
+- **`/metrics` endpoint** — live gauge (active renders, queue depth, `429` count, per-worker in-flight).
 - **Sync and async** interaction models.
 - **`429` backpressure** → retryable error in Kibana.
 - **Config gate / fallback** — with flags off, Kibana renders in-process exactly as today.
@@ -210,13 +291,15 @@ A more detailed runbook + curl examples live in
 
 ## Current browser lifecycle & isolation
 
-**What happens today (measured from the service logs):** the service constructs **one**
+**What happens today (measured from the worker logs):** each **worker** constructs **one**
 `Screenshots` + one `HeadlessChromiumDriverFactory` at startup, but **each render request calls
 `puppeteer.launch()` — a brand-new Chromium process** — opens a single page, captures, and then
 **closes the entire browser** (`browser.close()` + deletes the temp user-data dir). It does **not**
-reuse a long-lived browser and does **not** use incognito `BrowserContext`s. Requests are
-effectively serialized (the `Screenshots` semaphore is `poolSize: 1`, even though the service queue
-default `--concurrency` is 2 — a mismatch worth fixing).
+reuse a long-lived browser and does **not** use incognito `BrowserContext`s. Within a worker,
+renders are effectively serialized (the `Screenshots` semaphore is `poolSize: 1`). The router's
+`--concurrency` gates how many renders are dispatched across the worker pool, so **keep
+`--concurrency` ≈ (number of workers × per-worker capacity)** — with one `poolSize: 1` worker that
+means `--concurrency 1`.
 
 So today's model is the **most isolated but least efficient** end of the spectrum: full
 process-per-request isolation, no reuse, cold-start Chromium every time. That's fine for a POC and
@@ -231,9 +314,9 @@ Each option lists pros/cons and alternatives. None of these are decided.
 
 ### D1. How does the service get the render pipeline?
 
-Today the service `require()`s Kibana's plugin-internal modules from the same source tree. That
+Today each **worker** `require()`s Kibana's plugin-internal modules from the same source tree. That
 only works when built from a Kibana checkout — unacceptable for a service that ships and versions
-independently.
+independently. (This is the same coupling problem as the ES chunk-writer contract in [D6](#d6-result-storage-who-writes-to-es).)
 
 - **Option A — Extract a `@kbn/screenshotting-render` package.** Move `Screenshots`,
   `HeadlessChromiumDriverFactory`, layouts, and the driver into a standalone, versioned package the
@@ -295,7 +378,11 @@ Today: new Chromium **process per request** (see above). Options, from most to l
 
 ### D4. Authentication at the Kibana → service boundary
 
-Today: unauthenticated localhost HTTP; auth headers (API key) travel in the request body in plaintext.
+Today: Kibana sends the configured `apiKey` as `Authorization: ApiKey …` over **localhost HTTP (no
+TLS)**; the router forwards it to the worker, which **reuses it to write the result to ES**, and the
+router reuses it for ES reads. When unset, an `elastic:changeme` basic-auth fallback is used. So the
+key is static/shared, in cleartext on the wire, and grants whatever ES privileges it was minted with
+— all fine for a POC, none of it production-grade.
 
 - **Option A — mTLS + service token.** *Pros:* strong, standard for service-to-service. *Cons:* cert
   management/rotation.
@@ -312,16 +399,38 @@ Today: unauthenticated localhost HTTP; auth headers (API key) travel in the requ
 The POC implements both. *Sync* is simplest and slots right behind the Observable seam but holds a
 connection for the whole render. *Async* (submit → poll → download) matches Mike's "status endpoint
 so the connection isn't held open" and is friendlier to long renders and autoscaling, at the cost of
-poll latency and an in-memory job store (see D6).
+poll latency and the router's in-memory **job-status** registry (see D6).
 
-### D6. Result delivery
+### D6. Result storage: who writes to ES
 
-Today: bytes returned inline (sync) or held in an in-memory job store (async, lost on restart).
+**Decided: Option A — the worker writes the artifact directly to Elasticsearch.** ES is the only
+approved store (no object store, no broker), so the only open question was *who* writes it, and the
+constraints ("ES-only" + "no worker memory" + async) force the worker to write ES directly: with
+async there is nowhere else to park bytes between render-complete and download.
 
-- **Option A — Object store (S3/GCS) + return a reference.** *Pros:* scales to large PDFs, survives
-  restarts, decouples download. *Cons:* new dependency + lifecycle/cleanup.
-- **Option B — Stream bytes back.** *Pros:* simplest. *Cons:* ties up connections; awkward for very
-  large artifacts.
+**What the POC does:** the worker renders, then writes the artifact (base64 in a `binary`-typed
+field) to `reporting-service-poc-results` keyed by job id, reusing the request's API key; the router
+reads it back to serve downloads. No artifact bytes ever sit in service memory.
+
+Considered and set aside:
+- **B — worker streams bytes back; Kibana writes ES.** Keeps the worker stateless (no ES creds), but
+  can't do async without a parking spot → collapses back into A under the ES-only/no-memory rule.
+  Still attractive for a pure-sync, zero-ES-privilege worker.
+- **C — worker writes a temp ES location; Kibana finalizes.** A security boundary if the worker must
+  not hold final-index creds, but doubles the write + adds a move step.
+
+**Still to do to make A production-grade:**
+- **Reuse Kibana's chunk-writer contract.** Real Reporting chunks content into ~1 MB docs
+  (`reporting/server/lib/content_stream.ts`); the POC stores a single doc. Extract that writer into a
+  versioned package the worker shares (same coupling pattern as [D1](#d1-how-does-the-service-get-the-render-pipeline))
+  and write to the **real reporting data stream** so downloads flow through Kibana's existing path.
+- **Scoped, short-lived, per-job ES credentials** so a worker can only write the intended tenant's
+  index (ties into [D4](#d4-authentication-at-the-kibana--service-boundary)).
+- **Lifecycle ownership** — Kibana still owns the report record/status; define whether the worker
+  writes only content or also flips status, and make writes idempotent on `jobId` for crash retries.
+- **Durable job status** — the router's job-status registry is still in-memory (lost on restart) and
+  per-process (an async job submitted via one router replica can't be polled from another). Options:
+  derive status from the report record in ES, or use Task Manager as the source of truth.
 
 ### D7. Failure behavior when the service is unreachable
 
@@ -338,26 +447,65 @@ Open: one shared multi-tenant fleet vs. per-project/namespace deployment; how HP
 sourced; air-gapped/on-prem packaging; and "restrict reporting when not running in the supported
 containerized environment."
 
+### D9. Router / queue tier & backpressure ownership
+
+**Partially built:** the POC has a dedicated API/router tier that owns admission control and routes
+to a worker pool over HTTP. This is deliberately **no-broker** (constraint): the router keeps an
+in-process bounded queue + semaphore and returns `429` at capacity; Task Manager (in Kibana) remains
+the durable backlog.
+
+Open sub-decisions:
+- **Durable vs. in-process queue.** The router's queue and job-status registry are in-memory today
+  (fine for one replica; a restart drops in-flight status). Since brokers are off the table, the
+  durable backlog has to stay in **Task Manager**, with the router as a transient smoothing buffer.
+- **Multiple router replicas.** More than one router means admission control and the `/metrics`
+  gauge are per-replica; you'd need to aggregate (or front them so each worker pool has one router).
+- **Router ↔ worker protocol.** Today it's synchronous HTTP push (router holds the dispatch open
+  until the worker finishes + writes ES). A pull model would need shared state we're avoiding.
+
+### D10. Autoscaling signal
+
+**Decided: Option 1 — scale on the service's own live gauge.** The router exposes
+`GET /api/v1/metrics` (active renders, queued, `429` count, per-worker in-flight); an HPA/KEDA
+`metrics-api` scaler polls it. Nothing is persisted and no broker is needed — it's pure runtime
+state, which satisfies "only ES stores data."
+
+Open / to layer on later:
+- **Add a *demand* signal** (the gauge above is *saturation* — workers already busy). Two no-broker
+  sources: (a) reuse Task Manager's existing periodic **workload aggregation** via
+  `/api/task_manager/_health` (or `/api/task_manager/metrics`) — TM already counts tasks by
+  type/status every `monitored_aggregated_stats_refresh_rate` (default **60s**, min **5s**), so no
+  extra query load; or (b) a cheap filtered `_count` of in-flight report records in the reporting
+  index (data we own; a filtered count is cheap regardless of index size). Scale on `max(saturation,
+  demand)`.
+- **Avoid** pointing an autoscaler at heavy ad-hoc queries against the raw `.kibana_task_manager`
+  index — TM already aggregates, and a filtered `_count` is cheap.
+- CPU/memory HPA is a laggy backstop only.
+
 ---
 
 ## What we did NOT do
 
 - **Print-layout PDF** — broken (see above).
-- **Render-pipeline packaging** — the service imports Kibana internals instead of a versioned
+- **Render-pipeline packaging** — the worker imports Kibana internals instead of a versioned
   package (D1).
-- **Security** — no mTLS/auth at the service; auth headers in plaintext over localhost; no
-  credential hardening (short-lived/invalidate-on-complete keys); no egress allowlist.
+- **Real reporting-store integration** — the worker writes a **single** doc to a POC index rather
+  than reusing Kibana's chunked `content_stream` writer into the real reporting data stream (D6).
+- **TLS + hardened auth** — the API key is static/shared and travels over localhost HTTP without
+  TLS; no per-job/short-lived/invalidate-on-complete keys; no egress allowlist.
 - **True multi-tenant isolation** — single shared render pipeline, process-per-request, no
   per-tenant pools/contexts, no tenant tagging on logs/metrics/artifacts/keys.
 - **Serverless UIAM key strategy** validation for the remote handoff.
-- **Result durability** — async jobs are in-memory (lost on restart); no object store.
+- **Durable job status** — the router's job-status registry is in-memory (lost on restart) and
+  per-replica; only the *artifacts* are durable (in ES).
+- **Demand-based autoscaling** — only the router's saturation gauge exists; the Task-Manager/report
+  `_count` demand signal (D10) is documented, not wired.
 - **Containerization / K8s / HPA / per-provider deployment.**
-- **Observability** — console logging only; no metrics (queue depth, active renders, 429 rate,
-  durations), no tracing.
-- **Tests** — no unit/integration/security/load tests for the client, queue, or service.
+- **Observability** — a live `/metrics` gauge exists, but no historical metrics, durations, or tracing.
+- **Tests** — no unit/integration/security/load tests for the client, router, worker, or queue.
 - **`diagnose()`** routing to the service.
-- **Concurrency reconciliation** — the service queue's `--concurrency` (2) exceeds the
-  `Screenshots` semaphore (`poolSize: 1`), so effective concurrency is 1.
+- **Concurrency reconciliation** — keep the router's `--concurrency` ≈ (workers × per-worker
+  capacity); each worker's `Screenshots` semaphore is `poolSize: 1`.
 
 ## Open decisions
 
@@ -369,9 +517,13 @@ Quick index of the calls the team needs to make (details above):
    deployment-per-tenant).
 4. **D4** — auth at the boundary + per-job credential lifecycle.
 5. **D5** — sync vs. async (or both) as the supported contract.
-6. **D6** — result delivery (object store vs. inline).
+6. **D6** — result storage in ES: *decided — worker writes ES directly (A)*; remaining work is the
+   chunk-writer contract, scoped creds, and durable job status.
 7. **D7** — failure behavior (fail closed vs. local fallback, per environment).
 8. **D8** — deployment topology & where multi-tenancy is enforced.
+9. **D9** — router/queue tier ownership (durable-queue-in-Task-Manager, replica aggregation).
+10. **D10** — autoscaling signal: *decided — router `/metrics` saturation gauge (1)*; still to add a
+    Task-Manager/report `_count` demand signal.
 
 ### Other things worth deciding / adding
 

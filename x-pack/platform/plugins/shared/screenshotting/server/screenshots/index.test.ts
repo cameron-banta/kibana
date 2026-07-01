@@ -83,7 +83,7 @@ describe('Screenshot Observable Pipeline', () => {
       },
       networkPolicy: { enabled: false, rules: [] },
       browser: {} as ConfigType['browser'],
-      service: { enabled: false, url: undefined, mode: 'async' as const },
+      service: { enabled: false, url: undefined, mode: 'async' as const, apiKey: undefined },
     };
 
     screenshots = new Screenshots(driverFactory, logger, packageInfo, http, config, cloud);

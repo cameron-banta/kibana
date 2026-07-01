@@ -82,6 +82,11 @@ export const ConfigSchema = schema.object({
     mode: schema.oneOf([schema.literal('sync'), schema.literal('async')], {
       defaultValue: 'async',
     }),
+    // POC: Elasticsearch API key (encoded form) Kibana sends to the service as
+    // `Authorization: ApiKey <key>`. The service reuses it to read/write the
+    // rendered artifact in Elasticsearch. When unset, the service falls back to
+    // its own configured ES credentials.
+    apiKey: schema.maybe(schema.string()),
   }),
   capture: schema.object({
     timeouts: schema.object({

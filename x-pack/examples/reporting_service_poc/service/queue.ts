@@ -6,23 +6,29 @@
  */
 
 /**
- * Simple in-process concurrency queue.
+ * Admission-control queue for the API service (router).
  *
- * Limits how many renders run simultaneously. When the active-render count equals
- * maxConcurrency and the bounded queue is full, further requests receive 429.
+ * Limits how many renders are dispatched to workers simultaneously. When the
+ * active count equals maxConcurrency and the bounded wait-queue is full, further
+ * requests receive 429 + Retry-After — the backpressure contract from Mike's doc.
  *
- * This demonstrates the admission-control + backpressure contract Mike's doc
- * describes: the service returns 429 + Retry-After when at capacity, and Kibana
- * (Task Manager) backs off and retries.
+ * It also maintains the live counters exposed at GET /api/v1/metrics for
+ * autoscaling (decision "1"). It does NOT hold artifact bytes: rendered results
+ * live in Elasticsearch (written by the worker), so the job record here is just
+ * status metadata.
  */
 
 import crypto from 'crypto';
-import type { Job } from './types';
+import type { Job, ServiceMetrics } from './types';
 
 export class RenderQueue {
   private active = 0;
   private jobs = new Map<string, Job>();
   private pendingQueue: Array<() => void> = [];
+
+  private total429 = 0;
+  private totalCompleted = 0;
+  private totalFailed = 0;
 
   constructor(private readonly maxConcurrency: number, private readonly maxQueueDepth: number) {}
 
@@ -37,6 +43,25 @@ export class RenderQueue {
    */
   public get retryAfterSeconds(): number {
     return (this.pendingQueue.length + 1) * 30;
+  }
+
+  /** Record that a 429 was returned (called by the server). */
+  public record429(): void {
+    this.total429++;
+  }
+
+  /** Live gauge for the /metrics endpoint. `workers` is filled in by the server. */
+  public metrics(workers: ServiceMetrics['workers']): ServiceMetrics {
+    return {
+      activeRenders: this.active,
+      queued: this.pendingQueue.length,
+      maxConcurrency: this.maxConcurrency,
+      queueDepth: this.maxQueueDepth,
+      total429: this.total429,
+      totalCompleted: this.totalCompleted,
+      totalFailed: this.totalFailed,
+      workers,
+    };
   }
 
   /** Create a new job record in 'pending' state. Returns the job. */
@@ -85,23 +110,29 @@ export class RenderQueue {
     };
   }
 
-  /** Convenience: run work under a concurrency slot, updating job status automatically. */
-  async run(job: Job, work: () => Promise<Buffer>): Promise<void> {
+  /**
+   * Run `work` under a concurrency slot, updating job status automatically.
+   * `work` performs the dispatch to a worker and resolves with the artifact's
+   * content type once the worker has persisted the result to Elasticsearch.
+   */
+  async run(job: Job, work: () => Promise<{ contentType: string }>): Promise<void> {
     let release: (() => void) | undefined;
     try {
       release = await this.acquire();
       job.status = 'running';
       job.startedAt = Date.now();
 
-      const data = await work();
+      const { contentType } = await work();
 
-      job.resultBase64 = data.toString('base64');
+      job.contentType = contentType;
       job.status = 'completed';
       job.completedAt = Date.now();
+      this.totalCompleted++;
     } catch (err) {
       job.status = 'failed';
       job.error = err instanceof Error ? err.message : String(err);
       job.completedAt = Date.now();
+      this.totalFailed++;
     } finally {
       release?.();
     }
