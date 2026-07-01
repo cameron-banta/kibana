@@ -20,6 +20,7 @@ import { ChromiumArchivePaths, createConfig, getChromiumPackage } from '@kbn/scr
 import { from, switchMap } from 'rxjs';
 import { HeadlessChromiumDriverFactory, install } from './browsers';
 import { Screenshots } from './screenshots';
+import { ServiceScreenshotClient } from './service_client';
 
 interface SetupDeps {
   screenshotMode: ScreenshotModePluginSetup;
@@ -100,6 +101,30 @@ export class ScreenshottingPlugin implements Plugin<void, ScreenshottingStart, S
   }
 
   start({}: CoreStart): ScreenshottingStart {
+    const { service } = this.config;
+
+    if (service?.enabled && service.url) {
+      // POC: delegate screenshot generation to the external reporting service.
+      // All render logic (Chromium, navigation, waits, capture) runs in the service;
+      // Kibana only serialises the request and adapts the response.
+      const serviceClient = new ServiceScreenshotClient(
+        service.url,
+        service.mode ?? 'async',
+        this.logger.get('service-client')
+      );
+      this.logger.info(
+        `[reporting-service-poc] Remote reporting service ENABLED. ` +
+          `Delegating screenshots to ${service.url} (mode: ${service.mode ?? 'async'})`
+      );
+      return {
+        diagnose: () =>
+          from(this.browserDriverFactory).pipe(switchMap((factory) => factory.diagnose())),
+        getScreenshots: ((options) =>
+          serviceClient.getScreenshots(options)) as ScreenshottingStart['getScreenshots'],
+      };
+    }
+
+    // Default: local Chromium (existing behaviour, unchanged).
     return {
       diagnose: () =>
         from(this.browserDriverFactory).pipe(switchMap((factory) => factory.diagnose())),

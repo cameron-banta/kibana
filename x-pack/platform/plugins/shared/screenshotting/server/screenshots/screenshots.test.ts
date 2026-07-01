@@ -56,6 +56,7 @@ describe('class Screenshots', () => {
         zoom: 2,
       },
       poolSize: 1,
+      service: { enabled: false, url: undefined, mode: 'async' as const },
     };
 
     mockScreenshotModeSetup = {} as unknown as ScreenshotModePluginSetup;

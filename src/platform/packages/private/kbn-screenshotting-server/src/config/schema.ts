@@ -70,6 +70,19 @@ export const ConfigSchema = schema.object({
       }),
     }),
   }),
+  /**
+   * POC: multi-tenant reporting service integration.
+   * When enabled, Kibana delegates screenshot generation to an external HTTP service
+   * that owns Chromium, rather than launching it in-process.
+   * Default: disabled — existing local behaviour unchanged.
+   */
+  service: schema.object({
+    enabled: schema.boolean({ defaultValue: false }),
+    url: schema.maybe(schema.string()), // e.g. http://127.0.0.1:8790
+    mode: schema.oneOf([schema.literal('sync'), schema.literal('async')], {
+      defaultValue: 'async',
+    }),
+  }),
   capture: schema.object({
     timeouts: schema.object({
       openUrl: schema.oneOf([schema.number(), schema.duration()], {

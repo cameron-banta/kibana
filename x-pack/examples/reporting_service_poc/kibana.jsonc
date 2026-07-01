@@ -1,0 +1,13 @@
+{
+  "type": "plugin",
+  "id": "@kbn/reporting-service-poc-plugin",
+  "owner": "@elastic/kibana-reporting-services",
+  "group": "platform",
+  "visibility": "private",
+  "description": "POC: Multi-tenant Reporting Service (Mike Cote's proposal). Standalone HTTP service owns Chromium; Kibana sends an HTTP request instead of spawning Chromium in-process. Load with --run-examples.",
+  "plugin": {
+    "id": "reportingServicePoc",
+    "server": true,
+    "browser": false
+  }
+}
