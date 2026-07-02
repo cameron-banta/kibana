@@ -33,6 +33,14 @@ render workers, with artifacts persisted to Elasticsearch.
 - **Elasticsearch:** the single result store (result-storage decision **A** — see
   [D6](./decisions.md#d6-result-storage-who-writes-to-es)).
 
+> **Design direction beyond the POC:** the tiers above are what the POC *builds today*
+> (worker-writes-ES, Node/Puppeteer, in-process). The forward design leans to an async **result
+> callback** (worker POSTs the artifact back to Kibana, which owns storage), a **Go control plane +
+> containerized Chromium renderer image** (patched via an updatecli/GitOps pipeline), **one image that
+> runs standalone and in K8s/Serverless**, and a **generic, multi-consumer** render contract. See
+> decisions [D6](./decisions.md#d6-result-storage-who-writes-to-es),
+> [D7](./decisions.md#d7-failure-behavior--result-delivery), and D11–D14.
+
 ---
 
 ## What this POC does

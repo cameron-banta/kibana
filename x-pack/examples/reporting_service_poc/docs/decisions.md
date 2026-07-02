@@ -57,9 +57,15 @@ independently. (This is the same coupling problem as the ES chunk-writer contrac
     Kibana-supplied JS/CSS → needs signed-recipe + trusted-origin + egress allowlist; loses Option
     A's "same code = same output" guarantee; the Chromium/Puppeteer version still has to match the
     app's CSS/JS needs (looser coupling than importing code, but not zero).
-  - *Sub-decisions:* recipe-by-reference vs. fat-page; native-print vs. PNG-only; how the ready
-    signal is defined and verified (a render-parity regression gate — see
-    [Other things worth deciding](#other-things-worth-deciding--adding)).
+  - **Leaning (from design discussion):** deliver a **small inline recipe** in the REST request body
+    **plus a fat page URL** — drop *recipe-by-reference* (the recipe is small enough to inline; the
+    heavy content lives behind the fat URL). **Support both PDF strategies** via the `output` enum and
+    let the caller pick: native print-to-PDF for print layout, PNG(s) + Kibana-side pdfmake assembly
+    for preserve layout. Choosing this path (and reusing the synthetics Chromium image → Playwright,
+    see [D12](#d12-chromium-image--cve-patch-velocity)) **forecloses Option A** (no reuse of Kibana's
+    Puppeteer pipeline).
+  - *Remaining sub-decision:* how the ready signal is defined and verified — a render-parity
+    regression gate (see [Other things worth deciding](#other-things-worth-deciding--adding)).
 - **Option C — Keep it Kibana-aware (embed the contract).** The service embeds the render contract
   and is released in lockstep with Kibana.
   - *Pros:* simplest API.
@@ -135,16 +141,33 @@ poll latency and the router's in-memory **job-status** registry (see D6).
 
 ### D6. Result storage: who writes to ES
 
-**Decided: Option A — the worker writes the artifact directly to Elasticsearch.** ES is the only
-approved store (no object store, no broker), so the only open question was *who* writes it, and the
-constraints ("ES-only" + "no worker memory" + async) force the worker to write ES directly: with
-async there is nowhere else to park bytes between render-complete and download.
+**Decided for the current POC: Option A — the worker writes the artifact directly to Elasticsearch**
+(the productionization now leans to the **callback model** below). ES is the only approved store (no
+object store, no broker), so the only open question was *who* writes it, and the constraints
+("ES-only" + "no worker memory" + async) force the worker to write ES directly: with async there is
+nowhere else to park bytes between render-complete and download.
 
 **What the POC does:** the worker renders, then writes the artifact (base64 in a `binary`-typed
 field) to `reporting-service-poc-results` keyed by job id, reusing the request's API key; the router
 reads it back to serve downloads. No artifact bytes ever sit in service memory.
 
-Considered and set aside:
+**Design direction (post-POC): async result callback — supersedes worker-writes-ES.** The "who
+writes ES" question only forced Option A because *async had nowhere to park bytes*. A **callback
+URL** removes that constraint: on completion the worker POSTs the artifact (streamed) to a
+Kibana-supplied `callbackUrl` + short-lived token, and **Kibana** writes it to ES via its existing
+chunked `content_stream` writer. This:
+- makes the worker **stateless** — no ES credentials, no result-index knowledge, no chunk-writer to
+  extract (erases that D1-style coupling);
+- unblocks the previously-rejected **Option B** for async (the callback *is* the parking spot);
+- keeps **Kibana the owner** of storage + status (report record in ES), which also fixes the
+  multi-replica/durable-status wart — the router leaves the result path entirely;
+- generalizes to **non-Kibana consumers** (each caller supplies its own callback) — ES-write would
+  not (see [D14](#d14-multi-consumer--reusability)).
+
+Sync mode doesn't need this — it returns bytes in the HTTP response; the callback is the async story.
+See [D7](#d7-failure-behavior--result-delivery) for the callback failure/retry model.
+
+Considered and set aside (relative to the POC's Option A):
 - **B — worker streams bytes back; Kibana writes ES.** Keeps the worker stateless (no ES creds), but
   can't do async without a parking spot → collapses back into A under the ES-only/no-memory rule.
   Still attractive for a pure-sync, zero-ES-privilege worker.
@@ -165,13 +188,38 @@ Considered and set aside:
   per-process (an async job submitted via one router replica can't be polled from another). Options:
   derive status from the report record in ES, or use Task Manager as the source of truth.
 
-### D7. Failure behavior when the service is unreachable
+### D7. Failure behavior & result delivery
 
-- **Fail closed** (current-ish): the job fails clearly. *Pros:* preserves the isolation guarantee.
-  *Cons:* reports break during a service outage.
+Two related questions: what happens when the **service is unreachable at dispatch**, and how the
+async **result callback** ([D6](#d6-result-storage-who-writes-to-es)) behaves when *it* fails.
+
+**Service unreachable at dispatch:**
+- **Fail closed** (recommended): the job fails clearly and Task Manager retries later. *Pros:*
+  preserves the isolation guarantee. *Cons:* reports break during a service outage.
 - **Fall back to in-process Chromium.** *Pros:* resilience. *Cons:* re-introduces Chromium into
   Kibana pods (defeats the purpose) and hides outages. Likely acceptable only on Hosted/ECH, never
   Serverless.
+
+**Result-callback failure model** — there are **two distinct failure classes**:
+- **Render failed, service alive** → the callback carries a **terminal outcome**, not just bytes:
+  `{ jobId, status: "completed", <artifact> }` or `{ jobId, status: "failed", error }`. Kibana learns
+  of failure by push; no polling needed.
+- **Callback undeliverable (Kibana unreachable)** → push is impossible by definition. The worker
+  **retries with backoff**, holding the artifact and **going busy** (refusing new work) meanwhile;
+  after a **small** retry budget it **drops** the artifact and fails the job. Because the push channel
+  is down, Kibana learns via a **Task Manager deadline** — no terminal callback within the deadline ⇒
+  TM fails/retries the whole render. (Active polling is rejected: it re-introduces a queryable status
+  store in the service and can't help when the network to Kibana is down anyway.)
+
+**Load-shaping notes:**
+- Attempt the callback **immediately**; only enter the hold+busy+retry state on failure, so the
+  worker sits on bytes only in the degraded case.
+- Keep the worker retry budget **small** — a parked worker is lost fleet capacity; **Task Manager is
+  the durable retry layer**.
+- The callback endpoint must be **idempotent on `jobId`** — a lost ack causes a retry that
+  double-delivers; Kibana upserts and ignores duplicates.
+- *Scaling escape hatch:* spill the artifact to ephemeral local disk + background-drain instead of
+  holding in memory, so the worker keeps accepting work (reintroduces a little local state).
 
 ### D8. Deployment & multi-tenancy enforcement
 
@@ -215,6 +263,81 @@ Open / to layer on later:
   index — TM already aggregates, and a filtered `_count` is cheap.
 - CPU/memory HPA is a laggy backstop only.
 
+### D11. Implementation language / runtime
+
+The language choice is **downstream of D1**: a Go worker is only viable under **Option B** (a Go
+process can't run Kibana's TypeScript render pipeline, so Option A ⇒ Node).
+
+- **Control plane (router / dispatch) in Go.** No Kibana coupling, no Chromium — pure HTTP +
+  concurrency. Matches Elastic's Go-first production tooling; small static binary. *Strong, low-risk.*
+- **Renderer/worker language** — two coherent bundles:
+  - **Node + Puppeteer** — reuse Kibana's render pipeline (Option A) → best fidelity, but stays
+    Kibana-aware and Puppeteer-pinned.
+  - **Go or Node driving Chromium via CDP under Option B** — `chromedp`/`go-rod` (Go) or Puppeteer /
+    Playwright (Node). Fidelity then rides entirely on the ready-signal contract.
+- *Prior art:* **synthetics-service** is a **Go control plane** that orchestrates a **separate
+  Node/Playwright/Chromium runner image** — it validates "Go orchestration + separate browser image,"
+  **not** "Go drives Chromium." It has **zero** Go browser-driver deps.
+- *Gotcha:* two-language contract (TS caller + Go/other service) ⇒ maintain the API via a shared
+  schema (OpenAPI / JSON Schema) that generates both sides.
+- *Staging:* router in Go now (safe); keep/port the worker later once Option B + parity tests hold.
+
+### D12. Chromium image & CVE patch velocity
+
+The whole point (Mike's proposal) is patching Chromium **without a Kibana release**. The key
+realization from synthetics-service: **patch velocity comes from packaging + version automation, not
+from the worker's language.**
+
+- Ship the renderer as its own **independently-versioned container image**; patch = rebuild image +
+  bump the version pointer + GitOps rollout, decoupled from the control-plane release.
+- *Prior art (synthetics-service):* Chromium ships inside the `docker.elastic.co/beats/heartbeat`
+  image; **`updatecli`** (`.github/workflows/bump-heartbeat-snapshot.yml`) auto-opens PRs bumping
+  `heartbeatVersion` per environment overlay, rolled out via GitOps. Reuse this **pattern** (and
+  ideally the same Chromium supply chain).
+- **Reusing synthetics' Chromium ⇒ Playwright.** That image's Chromium is Playwright's bundled,
+  patched build; Playwright expects its own browser, so adopting it means **Playwright as the driver**
+  → which requires **D1 Option B** (Kibana's pipeline is Puppeteer-based). The alternative — keep
+  Puppeteer + Kibana's own Chromium build (Option A) and apply the *same updatecli bump pattern* to it
+  — gets the same velocity without literally sharing the image.
+- *Not reusable from synthetics:* the **Go execution-controller / pod-provisioning** (client-go
+  operator, ephemeral **Job-per-run**) — it's K8s-coupled and a different model from our long-lived
+  warm workers. Reuse its **kustomize overlays + image-prepuller** patterns, not the operator.
+
+### D13. Deployment packaging — standalone *and* Kubernetes/Serverless
+
+Requirement: the same service must run **standalone** (local / `docker run`) **and** in
+**K8s / Elastic Serverless**.
+
+- Package the renderer as **one self-contained container image** (HTTP server + Chromium). Standalone
+  = run the image directly; K8s = the **same image** as a `Deployment` + **HPA/KEDA** (see
+  [D10](#d10-autoscaling-signal)).
+- This is another reason **not** to reuse synthetics' Go operator: it's inherently K8s-coupled and
+  can't run standalone. A plain containerized HTTP service satisfies both modes with one artifact.
+- *Clarify:* "Serverless" here is assumed to mean **Elastic Serverless (on K8s)** — the Deployment +
+  HPA path. True FaaS (Lambda-style) is painful for heavyweight Chromium (memory + cold start).
+- Reuse synthetics' **image-prepuller** pattern to pre-cache the large Chromium image on nodes for
+  fast start.
+
+### D14. Multi-consumer / reusability
+
+Goal: other services (not just Kibana Reporting) could use the render service later. Reusability is a
+**free consequence of D1 Option B + the D6 callback** — a service with no Kibana knowledge is one any
+caller can use. Keep the seams clean now; defer shared-fleet machinery.
+
+- **Now (cheap — discipline):** neutral vocabulary (`render` / `job` / `artifact` / `callback`, never
+  `report` / `dashboard`); all consumer specifics as **opaque data** (`initScripts` / `styles` /
+  `waitFor` / `headers`); generic **bearer/token** auth (not Kibana's ES ApiKey); each caller owns its
+  **fat page + ready signal** and its **callback**; a **versioned** contract.
+- **Later (only when a 2nd consumer is real):** per-consumer auth + quotas + concurrency fairness;
+  per-consumer **egress allowlist** (SSRF containment); consumer-tagged observability; tenant/consumer
+  isolation (or sidestep via **per-consumer deployment** — same image, separate instance, tenancy at
+  the deployment boundary).
+- *Reality check on synthetics:* it runs **multi-step Playwright journeys** (assertions, per-step
+  timings/availability), not "URL → PDF/PNG." Our render API won't replace that. The realistic shared
+  surface is the **Chromium base image + CVE-bump pipeline**
+  ([D12](#d12-chromium-image--cve-patch-velocity)), not this API. Design generically, but don't
+  over-fit to synthetics as an API consumer.
+
 ---
 
 ## What we did NOT do
@@ -240,6 +363,9 @@ Open / to layer on later:
 - **`diagnose()`** routing to the service.
 - **Concurrency reconciliation** — keep the router's `--concurrency` ≈ (workers × per-worker
   capacity); each worker's `Screenshots` semaphore is `poolSize: 1`.
+- **Design-only (not built in the POC):** the async **result callback** (D6/D7), **Go control plane +
+  containerized Chromium image** (D11/D12), **standalone + K8s packaging** (D13), and **multi-consumer
+  controls** (D14). The POC still does worker-writes-ES, Node/Puppeteer, in-process.
 
 ## Open decisions
 
@@ -251,13 +377,21 @@ Quick index of the calls the team needs to make (details above):
    deployment-per-tenant).
 4. **D4** — auth at the boundary + per-job credential lifecycle.
 5. **D5** — sync vs. async (or both) as the supported contract.
-6. **D6** — result storage in ES: *decided — worker writes ES directly (A)*; remaining work is the
-   chunk-writer contract, scoped creds, and durable job status.
-7. **D7** — failure behavior (fail closed vs. local fallback, per environment).
+6. **D6** — result storage in ES: *POC does worker-writes-ES (A)*; design leans to the async
+   **callback** model (worker POSTs result to Kibana → removes ES/chunk-writer coupling).
+7. **D7** — failure behavior + result-delivery/callback retry model (fail-closed + Task Manager
+   deadline; small worker retry budget; idempotent callbacks).
 8. **D8** — deployment topology & where multi-tenancy is enforced.
 9. **D9** — router/queue tier ownership (durable-queue-in-Task-Manager, replica aggregation).
 10. **D10** — autoscaling signal: *decided — router `/metrics` saturation gauge (1)*; still to add a
     Task-Manager/report `_count` demand signal.
+11. **D11** — implementation language/runtime (Go control plane; renderer Node/Puppeteer or Option-B
+    CDP). Go worker ⇒ Option B.
+12. **D12** — Chromium image & CVE patch velocity (independently-versioned image + updatecli/GitOps;
+    synthetics prior art; reusing synthetics' Chromium ⇒ Playwright ⇒ Option B).
+13. **D13** — deployment packaging (one image runs standalone + K8s/Serverless; Deployment+HPA, not
+    job-per-run).
+14. **D14** — multi-consumer/reusability (neutral API + callback now; shared-fleet controls later).
 
 ### Other things worth deciding / adding
 
