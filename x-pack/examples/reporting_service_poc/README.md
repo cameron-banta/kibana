@@ -2,10 +2,10 @@
 
 Proof-of-concept for Mike Cote's multi-tenant reporting service proposal.
 
-> **📖 Canonical writeup:** the full background (summary of Mike's proposal + link), architecture,
-> what works / what doesn't, browser-isolation discussion, and the options/decisions ledger live in
-> [`src/platform/packages/private/kbn-screenshotting-server/README.md`](../../../src/platform/packages/private/kbn-screenshotting-server/README.md).
-> This file is just the practical runbook for the example plugin + service.
+> **📖 Design docs** (this file is the practical runbook; the design writeup lives in [`./docs`](./docs)):
+> - [Mike's proposal](./docs/proposal.md) — background, problems, benefits, sizing, alternatives
+> - [Architecture & behavior](./docs/architecture.md) — three-tier design, HTTP API, what works / what doesn't, browser lifecycle
+> - [Options, decisions & open questions](./docs/decisions.md) — the D1–D10 ledger
 
 **Core thesis:** Instead of spawning Chromium inside Kibana, Kibana sends an HTTP request to a
 standalone service. The service owns Chromium and the full render pipeline, renders the report, and
@@ -44,8 +44,8 @@ run it and ask questions. It is not intended for merge to `main`.
 
 > **Known issue:** PDF export with **"Optimize for printing" ON** (print layout) is currently
 > **broken** — it produces a PDF full of loading indicators/errors and is slow. PNG and
-> preserve-layout PDF work. See the
-> [`@kbn/screenshotting-server` README](../../../src/platform/packages/private/kbn-screenshotting-server/README.md#what-works--what-doesnt)
+> preserve-layout PDF work. See
+> [Architecture → what works / what doesn't](./docs/architecture.md#what-works--what-doesnt)
 > for the root-cause analysis.
 
 ---
@@ -209,7 +209,11 @@ router forwards it to the worker (reused for the ES write) and uses it for ES re
 x-pack/examples/reporting_service_poc/
 ├── kibana.jsonc                   Plugin manifest (near no-op; loaded with --run-examples)
 ├── tsconfig.json
-├── README.md                      ← you are here
+├── README.md                      ← you are here (runbook)
+├── docs/
+│   ├── proposal.md                Mike's proposal (background)
+│   ├── architecture.md            Three-tier design, HTTP API, what works / lifecycle
+│   └── decisions.md               Options + D1–D10 decisions ledger
 ├── server/
 │   ├── index.ts                   Plugin entry point
 │   └── plugin.ts                  Near no-op Kibana plugin class
@@ -226,8 +230,8 @@ x-pack/examples/reporting_service_poc/
     └── start_worker.js            Launcher for a render worker
 ```
 
-> The full design writeup (background, architecture, options, decisions, status) lives in the
-> [`@kbn/screenshotting-server` README](../../../src/platform/packages/private/kbn-screenshotting-server/README.md).
+> The full design writeup (background, architecture, options, decisions, status) lives in
+> [`./docs`](./docs).
 
 ### Kibana files changed
 
@@ -253,7 +257,7 @@ This POC is **localhost-only** and **not production-ready**. Deliberately out of
 - **No durable job status** — the router's job-status registry is in-memory (artifacts are durable in ES)
 - **No historical observability** — a live `/metrics` gauge exists, but no time-series metrics or tracing
 
-All of the above is documented in the [`@kbn/screenshotting-server` README](../../../src/platform/packages/private/kbn-screenshotting-server/README.md)
+All of the above is documented in [`./docs/decisions.md`](./docs/decisions.md)
 as the productionisation work this POC is meant to inform.
 
 ---
@@ -270,5 +274,4 @@ as the productionisation work this POC is meant to inform.
 7. **Autoscaling (D10):** Layer a Task-Manager/report `_count` demand signal onto the router's
    saturation gauge.
 
-See the [`@kbn/screenshotting-server` README](../../../src/platform/packages/private/kbn-screenshotting-server/README.md)
-for the full options/decisions ledger.
+See [`./docs/decisions.md`](./docs/decisions.md) for the full options/decisions ledger.
