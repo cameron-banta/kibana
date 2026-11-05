@@ -5,10 +5,11 @@
  * 2.0.
  */
 
-import React from 'react';
+import React, { useState } from 'react';
 import type { EuiBasicTableColumn } from '@elastic/eui';
 import {
   EuiBasicTable,
+  EuiButton,
   EuiCodeBlock,
   EuiDescriptionList,
   EuiFlexGroup,
@@ -19,8 +20,11 @@ import {
   EuiTitle,
 } from '@elastic/eui';
 import { KbnDangerCallout, KbnWarningCallout } from '@kbn/ui-callout';
+import { downloadFileAs } from '@kbn/share-plugin/public';
 import type { Execution, ResultDocument, Task } from '../../common';
-import { RESULT_INDEX } from '../../common';
+import { ISOMER_TASK_TYPE, RENDER_INDEX, RESULT_INDEX } from '../../common';
+import type { TaskRunnerApi } from '../api';
+import { errorMessage } from '../api';
 import { formatDuration, formatTime } from '../lib/format';
 import { OutputTable } from './output_table';
 import { StatusBadge } from './status_badge';
@@ -87,8 +91,68 @@ const Output = ({ task, output }: { task: Task; output: OutputState | undefined 
   return <OutputTable doc={output.doc} />;
 };
 
+const formatBytes = (bytes: number | undefined) =>
+  bytes === undefined ? '—' : `${Math.max(1, Math.round(bytes / 1024))} KB`;
+
+/** A succeeded `isomer_render` task's file in `tr-renders`, downloaded on demand. */
+const RenderOutput = ({ task, api }: { task: Task; api: TaskRunnerApi }) => {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string>();
+  const download = async () => {
+    setBusy(true);
+    setError(undefined);
+    try {
+      const { fileName, blob } = await api.getRender(task.taskId);
+      downloadFileAs(fileName, blob);
+    } catch (e) {
+      setError(errorMessage(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <>
+      <EuiText size="s">
+        {`${(task.result?.format ?? task.params.format ?? 'file').toUpperCase()}, ${formatBytes(
+          task.result?.bytes
+        )}, drawn in ${formatDuration(task.result?.renderMs ?? null)}`}
+      </EuiText>
+      <EuiSpacer size="s" />
+      <EuiButton
+        size="s"
+        iconType="download"
+        onClick={download}
+        isLoading={busy}
+        data-test-subj={`taskRunnerPocDownloadRender-${task.taskId}`}
+      >
+        Download
+      </EuiButton>
+      {error && (
+        <>
+          <EuiSpacer size="s" />
+          <KbnWarningCallout
+            announceOnMount
+            size="s"
+            title={`Couldn't read the render from ${RENDER_INDEX}`}
+          >
+            {error}
+          </KbnWarningCallout>
+        </>
+      )}
+    </>
+  );
+};
+
 /** The expanded row of a task: its output, its error, and every execution. */
-export const TaskDetails = ({ task, output }: { task: Task; output: OutputState | undefined }) => (
+export const TaskDetails = ({
+  task,
+  output,
+  api,
+}: {
+  task: Task;
+  output: OutputState | undefined;
+  api: TaskRunnerApi;
+}) => (
   <div data-test-subj={`taskRunnerPocTaskDetails-${task.taskId}`}>
     {task.error ? (
       <>
@@ -107,7 +171,11 @@ export const TaskDetails = ({ task, output }: { task: Task; output: OutputState 
         </EuiTitle>
         <EuiSpacer size="s" />
         {task.status === 'succeeded' ? (
-          <Output task={task} output={output} />
+          task.taskType === ISOMER_TASK_TYPE ? (
+            <RenderOutput task={task} api={api} />
+          ) : (
+            <Output task={task} output={output} />
+          )
         ) : (
           <EuiText size="s" color="subdued">
             {UNFINISHED.has(task.status)

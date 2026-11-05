@@ -9,6 +9,9 @@ import type { PluginInitializerContext } from '@kbn/core/public';
 import type { TaskRunnerPocPublicConfig } from './plugin';
 import { TaskRunnerPocPublicPlugin } from './plugin';
 
+export type { TaskRunnerPocPublicStart } from './plugin';
+export type { RenderFile } from './api';
+
 export function plugin(initializerContext: PluginInitializerContext<TaskRunnerPocPublicConfig>) {
   return new TaskRunnerPocPublicPlugin(initializerContext);
 }

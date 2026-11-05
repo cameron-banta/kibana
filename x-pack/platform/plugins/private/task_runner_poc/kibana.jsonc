@@ -12,6 +12,9 @@
     "requiredPlugins": [
       "features",
       "share"
+    ],
+    "extraPublicDirs": [
+      "common"
     ]
   }
 }

@@ -10,6 +10,7 @@ import {
   API_PRIVILEGES,
   INTERNAL_API_BASE_PATH,
   INTERNAL_API_VERSION,
+  RENDER_INDEX,
   RESULT_INDEX,
 } from '../../common';
 import type { ResultDocument } from '../../common';
@@ -82,4 +83,65 @@ export const registerTaskRoutes = ({ router, serviceClient }: RouteDependencies)
         }
       }
     );
+
+  router.versioned
+    .get({
+      path: `${INTERNAL_API_BASE_PATH}/tasks/{taskId}/render`,
+      access: 'internal',
+      summary: "Download an isomer_render task's file from tr-renders as the current user",
+      security: { authz: { requiredPrivileges: [API_PRIVILEGES.read] } },
+    })
+    .addVersion(
+      { version: INTERNAL_API_VERSION, validate: { request: { params: taskIdParamsSchema } } },
+      async (context, request, response) => {
+        const { taskId } = request.params;
+        const esClient = (await context.core).elasticsearch.client.asCurrentUser;
+        try {
+          const doc = await esClient.get<RenderDocument>({ index: RENDER_INDEX, id: taskId });
+          if (!doc.found || !doc._source?.content) {
+            return response.notFound({ body: { message: `No render for task ${taskId}` } });
+          }
+          const { content, format, title } = doc._source;
+          // Any task's API key can write tr-renders, so the stored contentType isn't trusted.
+          const contentType = RENDER_CONTENT_TYPES.get(format);
+          if (!contentType) {
+            return response.notFound({ body: { message: `No render for task ${taskId}` } });
+          }
+          return response.ok({
+            body: Buffer.from(content, 'base64'),
+            headers: {
+              'content-type': contentType,
+              'content-disposition': `attachment; filename="${fileName(title, format)}"`,
+            },
+          });
+        } catch (error) {
+          if (isNotFoundError(error)) {
+            return response.notFound({
+              body: { message: `No render for task ${taskId} in ${RENDER_INDEX}` },
+            });
+          }
+          return errorToResponse(response, error);
+        }
+      }
+    );
 };
+
+/** The fields of a `tr-renders` document the download reads. */
+interface RenderDocument {
+  content: string;
+  format: string;
+  title?: string;
+}
+
+const RENDER_CONTENT_TYPES = new Map([
+  ['pdf', 'application/pdf'],
+  ['png', 'image/png'],
+]);
+
+const fileName = (title: string | undefined, format: string) =>
+  `${
+    (title ?? '')
+      .replace(/[^\w\- ]+/g, '')
+      .trim()
+      .replace(/\s+/g, '_') || 'render'
+  }.${format}`;

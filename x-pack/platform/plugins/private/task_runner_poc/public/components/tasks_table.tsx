@@ -17,6 +17,7 @@ import {
 } from '@elastic/eui';
 import type { SharePluginStart } from '@kbn/share-plugin/public';
 import type { Job, Task } from '../../common';
+import { ISOMER_TASK_TYPE } from '../../common';
 import type { TaskRunnerApi } from '../api';
 import { errorMessage } from '../api';
 import { resultInDiscoverUrl } from '../lib/discover';
@@ -33,6 +34,8 @@ interface TasksTableProps {
   /** When given, adds a Job column showing how each task's job fires. */
   jobsById?: Map<string, Job>;
   noItemsMessage?: string;
+  /** A task whose details start expanded. */
+  initiallyExpanded?: string;
   'data-test-subj'?: string;
 }
 
@@ -49,9 +52,12 @@ export const TasksTable = ({
   tasks,
   jobsById,
   noItemsMessage = 'No tasks yet. Submit a query to create one.',
+  initiallyExpanded,
   'data-test-subj': dataTestSubj = 'taskRunnerPocTasksTable',
 }: TasksTableProps) => {
-  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [expanded, setExpanded] = useState<Set<string>>(
+    () => new Set(initiallyExpanded ? [initiallyExpanded] : [])
+  );
   const [outputs, setOutputs] = useState<Record<string, OutputState>>({});
 
   const toggle = (taskId: string) =>
@@ -67,7 +73,12 @@ export const TasksTable = ({
 
   useEffect(() => {
     for (const task of tasks ?? []) {
-      if (expanded.has(task.taskId) && task.status === 'succeeded' && !outputs[task.taskId]) {
+      if (
+        expanded.has(task.taskId) &&
+        task.status === 'succeeded' &&
+        task.taskType !== ISOMER_TASK_TYPE &&
+        !outputs[task.taskId]
+      ) {
         const { taskId } = task;
         setOutputs((current) => ({ ...current, [taskId]: { state: 'loading' } }));
         api.getTaskOutput(taskId).then(
@@ -161,7 +172,7 @@ export const TasksTable = ({
       name: 'Output',
       width: '70px',
       render: (task: Task) =>
-        task.status === 'succeeded' && task.finishedAt ? (
+        task.status === 'succeeded' && task.finishedAt && task.taskType !== ISOMER_TASK_TYPE ? (
           <EuiToolTip content="Open the result document in Discover" disableScreenReaderOutput>
             <EuiButtonIcon
               iconType="discoverApp"
@@ -178,7 +189,10 @@ export const TasksTable = ({
   const itemIdToExpandedRowMap = Object.fromEntries(
     (tasks ?? [])
       .filter(({ taskId }) => expanded.has(taskId))
-      .map((task) => [task.taskId, <TaskDetails task={task} output={outputs[task.taskId]} />])
+      .map((task) => [
+        task.taskId,
+        <TaskDetails task={task} output={outputs[task.taskId]} api={api} />,
+      ])
   );
 
   return (

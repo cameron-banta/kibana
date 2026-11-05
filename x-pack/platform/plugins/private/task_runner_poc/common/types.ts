@@ -23,6 +23,24 @@ export interface EsqlSummaryParams {
   resultIndex: string;
 }
 
+export interface IsomerRenderParams {
+  inputIndex: string;
+  inputId: string;
+  resultIndex: string;
+  format: 'png' | 'pdf';
+}
+
+/** What an `isomer_render` task reports; the file itself is in `index`, with `_id` = the task id. */
+export interface IsomerRenderResult {
+  format: 'png' | 'pdf';
+  bytes: number;
+  renderMs: number;
+  index: string;
+  id: string;
+}
+
+export type TaskParams = Partial<EsqlSummaryParams & IsomerRenderParams>;
+
 export interface TaskRef {
   taskId: string;
   status: TaskStatus;
@@ -36,7 +54,7 @@ export interface Job {
   flowId: string | null;
   taskType: string;
   workerType: string;
-  params: Partial<EsqlSummaryParams>;
+  params: TaskParams;
   every: string | null;
   runAt: string | null;
   timeout: string;
@@ -69,7 +87,7 @@ export interface Task {
   jobId: string;
   taskType: string;
   workerType: string;
-  params: Partial<EsqlSummaryParams>;
+  params: TaskParams;
   status: TaskStatus;
   execution: number;
   maxExecutions: number;
@@ -83,7 +101,7 @@ export interface Task {
   /** The last finished execution's error; kept while retrying, null once one succeeds. */
   error: string | null;
   retryable: boolean | null;
-  result: { rows?: number } | null;
+  result: ({ rows?: number } & Partial<IsomerRenderResult>) | null;
   executions: Execution[];
 }
 

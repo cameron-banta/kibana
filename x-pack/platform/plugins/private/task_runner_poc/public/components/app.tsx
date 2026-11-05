@@ -39,6 +39,8 @@ export interface AppProps {
   openConfirm: OverlayStart['openConfirm'];
   projectId: string;
   canWrite: boolean;
+  /** A task whose details start expanded. */
+  expandedTaskId?: string;
 }
 
 const ListPanel = ({
@@ -78,7 +80,15 @@ const ListPanel = ({
   </EuiPanel>
 );
 
-export const App = ({ api, share, toasts, openConfirm, projectId, canWrite }: AppProps) => {
+export const App = ({
+  api,
+  share,
+  toasts,
+  openConfirm,
+  projectId,
+  canWrite,
+  expandedTaskId,
+}: AppProps) => {
   const listTasks = useCallback(() => api.listTasks(), [api]);
   const listJobs = useCallback(() => api.listJobs(), [api]);
   const tasks = usePolling(listTasks, POLL_INTERVAL_MS);
@@ -158,7 +168,13 @@ export const App = ({ api, share, toasts, openConfirm, projectId, canWrite }: Ap
         </ListPanel>
         <EuiSpacer size="l" />
         <ListPanel title="Tasks" error={tasks.error} errorTitle="Couldn't load tasks">
-          <TasksTable api={api} share={share} tasks={tasks.data?.tasks} jobsById={jobsById} />
+          <TasksTable
+            api={api}
+            share={share}
+            tasks={tasks.data?.tasks}
+            jobsById={jobsById}
+            initiallyExpanded={expandedTaskId}
+          />
         </ListPanel>
       </KibanaPageTemplate.Section>
     </KibanaPageTemplate>

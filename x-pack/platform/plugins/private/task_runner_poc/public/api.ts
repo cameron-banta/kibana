@@ -12,11 +12,17 @@ import type {
   CreateJobResponse,
   JobList,
   ResultDocument,
+  Task,
   TaskList,
 } from '../common';
 
 const LIST_LIMIT = 50;
 const JOB_TASKS_LIMIT = 10;
+
+export interface RenderFile {
+  fileName: string;
+  blob: Blob;
+}
 
 export interface TaskRunnerApi {
   createJob(body: CreateJobBody): Promise<CreateJobResponse>;
@@ -24,8 +30,14 @@ export interface TaskRunnerApi {
   deleteJob(jobId: string): Promise<void>;
   listJobTasks(jobId: string): Promise<TaskList>;
   listTasks(): Promise<TaskList>;
+  getTask(taskId: string): Promise<Task>;
   getTaskOutput(taskId: string): Promise<ResultDocument>;
+  /** An `isomer_render` task's file; fetched, since a plain link can't send the internal API's headers. */
+  getRender(taskId: string): Promise<RenderFile>;
 }
+
+const fileNameFrom = (contentDisposition: string | null, fallback: string) =>
+  contentDisposition?.match(/filename="([^"]+)"/)?.[1] ?? fallback;
 
 export const createApi = (http: HttpSetup): TaskRunnerApi => {
   const version = INTERNAL_API_VERSION;
@@ -41,8 +53,23 @@ export const createApi = (http: HttpSetup): TaskRunnerApi => {
         query: { limit: JOB_TASKS_LIMIT },
       }),
     listTasks: () => http.get(path('/tasks'), { version, query: { limit: LIST_LIMIT } }),
+    getTask: (taskId) => http.get(path(`/tasks/${encodeURIComponent(taskId)}`), { version }),
     getTaskOutput: (taskId) =>
       http.get(path(`/tasks/${encodeURIComponent(taskId)}/output`), { version }),
+    getRender: async (taskId) => {
+      const { response } = await http.get(path(`/tasks/${encodeURIComponent(taskId)}/render`), {
+        version,
+        asResponse: true,
+        rawResponse: true,
+      });
+      if (!response) {
+        throw new Error(`The render of task ${taskId} didn't download`);
+      }
+      return {
+        fileName: fileNameFrom(response.headers.get('content-disposition'), 'render'),
+        blob: await response.blob(),
+      };
+    },
   };
 };
 

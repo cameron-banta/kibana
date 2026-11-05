@@ -19,6 +19,11 @@ export const API_PRIVILEGES = {
 export const TASK_TYPE = 'esql_summary';
 export const RESULT_INDEX = 'tr-results';
 
+/** Draws an Isomer composition from `tr-isomer-inputs` into `tr-renders` (contract README, `isomer_render`). */
+export const ISOMER_TASK_TYPE = 'isomer_render';
+export const ISOMER_INPUT_INDEX = 'tr-isomer-inputs';
+export const RENDER_INDEX = 'tr-renders';
+
 export const DEFAULT_QUERY =
   'FROM logs-* | STATS errors = COUNT(*) WHERE log.level == "error" BY service.name';
 
@@ -36,11 +41,14 @@ export type {
   EsqlValue,
   Execution,
   ExecutionStatus,
+  IsomerRenderParams,
+  IsomerRenderResult,
   Job,
   JobList,
   ResultDocument,
   Task,
   TaskList,
+  TaskParams,
   TaskRef,
   TaskStatus,
 } from './types';

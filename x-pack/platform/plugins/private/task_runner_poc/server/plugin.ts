@@ -5,10 +5,18 @@
  * 2.0.
  */
 
-import type { CoreSetup, Logger, Plugin, PluginInitializerContext } from '@kbn/core/server';
+import type {
+  CoreSetup,
+  CoreStart,
+  Logger,
+  Plugin,
+  PluginInitializerContext,
+} from '@kbn/core/server';
 import type { FeaturesPluginSetup } from '@kbn/features-plugin/server';
 import type { TaskRunnerPocConfig } from './config';
 import { registerFeature } from './features';
+import { createIsomerRenderSubmitter } from './isomer_render';
+import type { TaskRunnerPocServerStart } from './isomer_render';
 import { registerRoutes } from './routes';
 import { TaskRunnerServiceClient } from './service_client';
 
@@ -16,13 +24,17 @@ export interface TaskRunnerPocSetupDependencies {
   features: FeaturesPluginSetup;
 }
 
-export class TaskRunnerPocPlugin implements Plugin<void, void, TaskRunnerPocSetupDependencies> {
+export class TaskRunnerPocPlugin
+  implements Plugin<void, TaskRunnerPocServerStart, TaskRunnerPocSetupDependencies>
+{
   private readonly config: TaskRunnerPocConfig;
   private readonly logger: Logger;
+  private readonly serviceClient: TaskRunnerServiceClient;
 
   constructor(initializerContext: PluginInitializerContext<TaskRunnerPocConfig>) {
     this.config = initializerContext.config.get();
     this.logger = initializerContext.logger.get();
+    this.serviceClient = new TaskRunnerServiceClient(this.config);
   }
 
   public setup(core: CoreSetup, { features }: TaskRunnerPocSetupDependencies) {
@@ -38,7 +50,7 @@ export class TaskRunnerPocPlugin implements Plugin<void, void, TaskRunnerPocSetu
       router: core.http.createRouter(),
       logger: this.logger,
       projectId,
-      serviceClient: new TaskRunnerServiceClient(this.config),
+      serviceClient: this.serviceClient,
       getApiKeys: async () => {
         const [coreStart] = await core.getStartServices();
         return coreStart.security.authc.apiKeys;
@@ -46,7 +58,17 @@ export class TaskRunnerPocPlugin implements Plugin<void, void, TaskRunnerPocSetu
     });
   }
 
-  public start() {}
+  public start(core: CoreStart): TaskRunnerPocServerStart {
+    return {
+      submitIsomerRender: createIsomerRenderSubmitter({
+        apiKeys: core.security.authc.apiKeys,
+        elasticsearch: core.elasticsearch,
+        serviceClient: this.serviceClient,
+        projectId: this.config.projectId,
+        logger: this.logger,
+      }),
+    };
+  }
 
   public stop() {}
 }

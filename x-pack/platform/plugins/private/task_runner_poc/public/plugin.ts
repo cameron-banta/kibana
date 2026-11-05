@@ -8,12 +8,18 @@
 import type {
   AppMountParameters,
   CoreSetup,
+  CoreStart,
   Plugin,
   PluginInitializerContext,
 } from '@kbn/core/public';
 import { DEFAULT_APP_CATEGORIES } from '@kbn/core/public';
 import type { SharePluginStart } from '@kbn/share-plugin/public';
 import { PLUGIN_ID, PLUGIN_NAME } from '../common';
+import type { TaskRunnerApi } from './api';
+import { createApi } from './api';
+
+/** What other plugins use to follow a task they submitted through the server's start contract. */
+export type TaskRunnerPocPublicStart = Pick<TaskRunnerApi, 'getTask' | 'getRender'>;
 
 /** The part of `task_runner_poc` config the server exposes to the browser. */
 export interface TaskRunnerPocPublicConfig {
@@ -25,7 +31,7 @@ export interface TaskRunnerPocStartDependencies {
 }
 
 export class TaskRunnerPocPublicPlugin
-  implements Plugin<void, void, object, TaskRunnerPocStartDependencies>
+  implements Plugin<void, TaskRunnerPocPublicStart, object, TaskRunnerPocStartDependencies>
 {
   private readonly projectId: string;
 
@@ -49,7 +55,10 @@ export class TaskRunnerPocPublicPlugin
     });
   }
 
-  public start() {}
+  public start(core: CoreStart): TaskRunnerPocPublicStart {
+    const { getTask, getRender } = createApi(core.http);
+    return { getTask, getRender };
+  }
 
   public stop() {}
 }

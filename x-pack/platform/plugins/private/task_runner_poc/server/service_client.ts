@@ -8,6 +8,7 @@
 import type {
   CreateJobResponse,
   EsqlSummaryParams,
+  IsomerRenderParams,
   Job,
   JobList,
   Task,
@@ -21,7 +22,7 @@ const REQUEST_TIMEOUT_MS = 10_000;
 /** Request body of the service's `POST /v1/projects/{projectId}/jobs`. */
 export interface ServiceCreateJobRequest {
   taskType: string;
-  params: EsqlSummaryParams;
+  params: EsqlSummaryParams | IsomerRenderParams;
   apiKey: string;
   every?: string;
   runAt?: string;

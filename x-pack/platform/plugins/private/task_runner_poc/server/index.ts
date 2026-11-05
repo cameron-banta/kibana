@@ -9,6 +9,7 @@ import type { PluginInitializerContext } from '@kbn/core/server';
 import type { TaskRunnerPocConfig } from './config';
 
 export { config } from './config';
+export type { IsomerRenderInput, TaskRunnerPocServerStart } from './isomer_render';
 
 export async function plugin(initializerContext: PluginInitializerContext<TaskRunnerPocConfig>) {
   const { TaskRunnerPocPlugin } = await import('./plugin');

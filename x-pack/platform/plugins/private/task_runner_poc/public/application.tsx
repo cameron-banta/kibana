@@ -21,8 +21,10 @@ export interface RenderAppDependencies {
 
 export const renderApp = (
   { coreStart, share, projectId }: RenderAppDependencies,
-  { element }: AppMountParameters
+  { element, history }: AppMountParameters
 ) => {
+  // `?task=<taskId>` opens the page with that task's details expanded, for links from other apps.
+  const expandedTaskId = new URLSearchParams(history.location.search).get('task') ?? undefined;
   coreStart.chrome.docTitle.change(PLUGIN_NAME);
   coreStart.chrome.setBreadcrumbs([{ text: PLUGIN_NAME }]);
 
@@ -36,6 +38,7 @@ export const renderApp = (
         openConfirm={coreStart.overlays.openConfirm}
         projectId={projectId}
         canWrite={coreStart.application.capabilities[PLUGIN_ID]?.write === true}
+        expandedTaskId={expandedTaskId}
       />
     )
   );
