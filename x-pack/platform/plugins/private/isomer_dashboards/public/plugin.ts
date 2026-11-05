@@ -7,25 +7,31 @@
 
 import type { CoreSetup, Plugin } from '@kbn/core/public';
 import type { ExportShareDerivatives, SharePluginSetup } from '@kbn/share-plugin/public';
+import type { TaskRunnerPocPublicStart } from '@kbn/task-runner-poc-plugin/public';
 
 interface SetupDeps {
   share: SharePluginSetup;
 }
 
+interface StartDeps {
+  /** Present when the task runner POC is enabled; the flyout then offers to render there. */
+  taskRunnerPoc?: TaskRunnerPocPublicStart;
+}
+
 // Dashboard's export menu labels an integration it doesn't know by its id.
 export const ISOMER_EXPORT_ID = 'PDF (Isomer)';
 
-export class IsomerDashboardsPublicPlugin implements Plugin<{}, {}, SetupDeps> {
-  setup(core: CoreSetup, { share }: SetupDeps) {
+export class IsomerDashboardsPublicPlugin implements Plugin<{}, {}, SetupDeps, StartDeps> {
+  setup(core: CoreSetup<StartDeps>, { share }: SetupDeps) {
     share.registerShareIntegration<ExportShareDerivatives>('dashboard', {
       id: ISOMER_EXPORT_ID,
       groupId: 'exportDerivatives',
       getShareIntegrationConfig: async () => {
-        const [[coreStart], { isomerExportConfig }] = await Promise.all([
+        const [[coreStart, { taskRunnerPoc }], { isomerExportConfig }] = await Promise.all([
           core.getStartServices(),
           import('./export_config'),
         ]);
-        return isomerExportConfig(coreStart);
+        return isomerExportConfig(coreStart, taskRunnerPoc);
       },
     });
     return {};

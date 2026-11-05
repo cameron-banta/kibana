@@ -16,6 +16,7 @@
     "@kbn/isomer-lowering",
     "@kbn/isomer-primitives-dashboard",
     "@kbn/isomer-theme",
-    "@kbn/share-plugin"
+    "@kbn/share-plugin",
+    "@kbn/task-runner-poc-plugin"
   ]
 }

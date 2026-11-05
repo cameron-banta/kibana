@@ -9,6 +9,7 @@
     "id": "isomerDashboards",
     "browser": true,
     "server": true,
-    "requiredPlugins": ["dataViews", "isomer", "share"]
+    "requiredPlugins": ["dataViews", "isomer", "share"],
+    "optionalPlugins": ["taskRunnerPoc"]
   }
 }

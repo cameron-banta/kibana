@@ -21,6 +21,7 @@ import {
   panelBodySize,
 } from '@kbn/isomer-primitives-dashboard';
 import { borealisLight } from '@kbn/isomer-theme';
+import { API_PRIVILEGES as TASK_RUNNER_PRIVILEGES } from '@kbn/task-runner-poc-plugin/common';
 
 import { API_BASE, type DashboardLayout, DRAW_MAX_BYTES, PAGE_WIDTH, VIEW_BASE } from '../common';
 import type { IsomerDashboardsStartDeps } from './types';
@@ -52,6 +53,13 @@ const pdfBody = schema.object({
   controls: controlsSchema,
   // Draws in the isomer plugin's render process instead of this one.
   host: schema.boolean({ defaultValue: false }),
+});
+const taskRunnerBody = schema.object({
+  timeRange: schema.maybe(schema.object({ from: time, to: time })),
+  layout: layoutSchema('grid'),
+  width: widthSchema,
+  controls: controlsSchema,
+  format: schema.oneOf([schema.literal('png'), schema.literal('pdf')], { defaultValue: 'pdf' }),
 });
 // A composition from the composition route, gzipped by the flyout; DRAW_MAX_BYTES bounds it.
 const drawBody = schema.object({
@@ -100,6 +108,19 @@ const fileName = (title: string) =>
 const notFound = (error: unknown) =>
   (error as { output?: { statusCode?: number } })?.output?.statusCode === 404 ||
   /not found|not exist/i.test(String((error as Error)?.message));
+
+/**
+ * The task runner's or Elasticsearch's status when it's the caller's to fix (429 to back off, for one),
+ * 502 for its other failures, and 500 for Kibana's own. Never 401: the browser would take it as Kibana's
+ * session ending.
+ */
+const upstreamStatus = (error: unknown) => {
+  const status = (error as { statusCode?: number })?.statusCode;
+  if (status === undefined) {
+    return 500;
+  }
+  return status >= 400 && status < 500 && status !== 401 ? status : 502;
+};
 
 /** How a dashboard's composition draws: on Kibana's page at the layout's width, each chart at its panel's body. */
 const drawOptions = ({
@@ -349,6 +370,52 @@ export const registerRoutes = (
           ? response.notFound({ body: { message: `Dashboard ${id} not found` } })
           : response.customError({
               statusCode: 500,
+              body: { message: String((error as Error)?.message ?? error) },
+            });
+      }
+    }
+  );
+
+  // Lowers here, as the user, and hands the composition to the task runner's isomer worker to draw.
+  router.post(
+    {
+      path: `${API_BASE}/{id}/task_runner`,
+      security: { authz: { requiredPrivileges: [TASK_RUNNER_PRIVILEGES.manage] } },
+      options: { access: 'internal' },
+      validate: { params, body: taskRunnerBody },
+    },
+    async (context, request, response) => {
+      const { id } = request.params;
+      const { timeRange, layout, width, controls, format } = request.body as TypeOf<
+        typeof taskRunnerBody
+      >;
+      const [, { taskRunnerPoc }] = await getStartServices();
+      if (!taskRunnerPoc) {
+        return response.notFound({ body: { message: 'The task runner plugin is not enabled' } });
+      }
+      try {
+        const { converted, composition, hints } = await prepare(context, request, {
+          id,
+          ...(timeRange ? { timeRange } : {}),
+          layout,
+          ...(width ? { width } : {}),
+          ...(controls ? { controls: controls as PinnedControl[] } : {}),
+        });
+        const created = await taskRunnerPoc.submitIsomerRender(request, {
+          title: converted.title,
+          composition,
+          format,
+          options: {
+            ...hostDrawOptions(composition, { layout, ...(width ? { width } : {}), hints }),
+            metadata: { title: converted.title, creator: 'Kibana (Isomer, task runner)' },
+          },
+        });
+        return response.ok({ body: created });
+      } catch (error) {
+        return notFound(error)
+          ? response.notFound({ body: { message: `Dashboard ${id} not found` } })
+          : response.customError({
+              statusCode: upstreamStatus(error),
               body: { message: String((error as Error)?.message ?? error) },
             });
       }

@@ -31,8 +31,11 @@ import {
   type ExportShareParameters,
   useShareTypeContext,
 } from '@kbn/share-plugin/public';
+import { PLUGIN_ID as TASK_RUNNER_APP_ID } from '@kbn/task-runner-poc-plugin/common';
+import type { TaskRunnerPocPublicStart } from '@kbn/task-runner-poc-plugin/public';
 
 import { API_BASE, type DashboardLayout, DRAW_MAX_BYTES, VIEW_BASE } from '../common';
+import { TaskRunnerRender } from './task_runner_render';
 
 interface PinnedPanel {
   id?: string;
@@ -121,6 +124,37 @@ const draw = async (
   }
 };
 
+/** As Reporting does for a PDF: the work goes on elsewhere, so the toast says where to follow it. */
+const showTaskRunnerToast = (core: CoreStart, title: string, taskId: string | null) => {
+  const openTaskRunner = () =>
+    core.application.navigateToApp(TASK_RUNNER_APP_ID, {
+      ...(taskId ? { path: `?task=${encodeURIComponent(taskId)}` } : {}),
+    });
+  core.notifications.toasts.addSuccess(
+    {
+      title: i18n.translate('xpack.isomerDashboards.taskRunnerToast.title', {
+        defaultMessage: 'Rendering {title} with the task runner',
+        values: { title },
+      }),
+      text: i18n.translate('xpack.isomerDashboards.taskRunnerToast.text', {
+        defaultMessage:
+          'An isomer worker is drawing the PDF. Follow it in the export panel, or in the task runner.',
+      }),
+      actionProps: {
+        primary: {
+          children: i18n.translate('xpack.isomerDashboards.taskRunnerToast.open', {
+            defaultMessage: 'Open the task runner',
+          }),
+          onClick: openTaskRunner,
+          'data-test-subj': 'isomerDashboardsOpenTaskRunner',
+        },
+      },
+      'data-test-subj': 'isomerDashboardsTaskRunnerToast',
+    },
+    { toastLifeTimeMs: 30_000 }
+  );
+};
+
 const LAYOUTS = [
   {
     id: 'grid',
@@ -136,9 +170,11 @@ const LAYOUTS = [
 
 const IsomerExportFlyout = ({
   core,
+  taskRunner,
   closeFlyout,
 }: {
   core: CoreStart;
+  taskRunner?: TaskRunnerPocPublicStart;
   closeFlyout: () => void;
 }) => {
   const { objectId, sharingData, isDirty } = useShareTypeContext(
@@ -155,8 +191,9 @@ const IsomerExportFlyout = ({
   const [layout, setLayout] = useState<DashboardLayout>('grid');
   const [spec, setSpec] = useState<Spec>();
   const [preview, setPreview] = useState<string>();
-  const [busy, setBusy] = useState<'preview' | 'pdf'>();
+  const [busy, setBusy] = useState<'preview' | 'pdf' | 'taskRunner'>();
   const [error, setError] = useState<string>();
+  const [taskRunnerTaskId, setTaskRunnerTaskId] = useState<string>();
   const path = objectId ? buildPath(`${API_BASE}/{id}/composition`, { id: objectId }) : undefined;
 
   // The composition is made once per layout; the preview, the PDF and the composition download all use it.
@@ -204,6 +241,29 @@ const IsomerExportFlyout = ({
     try {
       downloadFileAs(`${title}.pdf`, await draw(core, spec, 'pdf', title));
       closeFlyout();
+    } catch (e) {
+      setError(errorMessage(e));
+    } finally {
+      setBusy(undefined);
+    }
+  };
+
+  // Lowers on the server again rather than posting the preview's composition, as a scheduled render would.
+  const renderWithTaskRunner = async () => {
+    if (!objectId) {
+      return;
+    }
+    setBusy('taskRunner');
+    setError(undefined);
+    setTaskRunnerTaskId(undefined);
+    try {
+      const { taskId } = await core.http.post<{ jobId: string; taskId: string | null }>(
+        buildPath(`${API_BASE}/{id}/task_runner`, { id: objectId }),
+        { body: JSON.stringify({ layout, ...onScreen, format: 'pdf' }) }
+      );
+      // The toast outlives the flyout, which follows the task only while it's open.
+      showTaskRunnerToast(core, title, taskId);
+      setTaskRunnerTaskId(taskId ?? undefined);
     } catch (e) {
       setError(errorMessage(e));
     } finally {
@@ -300,6 +360,16 @@ const IsomerExportFlyout = ({
             <KbnDangerCallout size="s" title={error} />
           </>
         )}
+        {taskRunner && taskRunnerTaskId && (
+          <>
+            <EuiSpacer size="m" />
+            <TaskRunnerRender
+              key={taskRunnerTaskId}
+              taskRunner={taskRunner}
+              taskId={taskRunnerTaskId}
+            />
+          </>
+        )}
         {(preview || busy === 'preview') && (
           <>
             <EuiSpacer size="m" />
@@ -358,6 +428,21 @@ const IsomerExportFlyout = ({
               })}
             </EuiButtonEmpty>
           </EuiFlexItem>
+          {taskRunner && (
+            <EuiFlexItem grow={false}>
+              <EuiButtonEmpty
+                iconType="clock"
+                onClick={renderWithTaskRunner}
+                isLoading={busy === 'taskRunner'}
+                isDisabled={!path || busy === 'pdf' || busy === 'taskRunner'}
+                data-test-subj="isomerDashboardsRenderWithTaskRunner"
+              >
+                {i18n.translate('xpack.isomerDashboards.flyout.taskRunner', {
+                  defaultMessage: 'Render with task runner',
+                })}
+              </EuiButtonEmpty>
+            </EuiFlexItem>
+          )}
           <EuiFlexItem grow={false}>
             <EuiButton
               fill
@@ -379,7 +464,10 @@ const IsomerExportFlyout = ({
 };
 
 /** The share menu entry: a flyout that previews the page, then downloads it as a PDF, or opens the mobile view. */
-export const isomerExportConfig = (core: CoreStart): ExportShareParameters => ({
+export const isomerExportConfig = (
+  core: CoreStart,
+  taskRunner?: TaskRunnerPocPublicStart
+): ExportShareParameters => ({
   label: ({ openFlyout }) => (
     <EuiButtonEmpty size="s" iconType="document" onClick={openFlyout}>
       {i18n.translate('xpack.isomerDashboards.label', { defaultMessage: 'PDF (Isomer)' })}
@@ -387,5 +475,7 @@ export const isomerExportConfig = (core: CoreStart): ExportShareParameters => ({
   ),
   shouldRender: () => true,
   flyoutSizing: { size: 'm' },
-  flyoutContent: ({ closeFlyout }) => <IsomerExportFlyout core={core} closeFlyout={closeFlyout} />,
+  flyoutContent: ({ closeFlyout }) => (
+    <IsomerExportFlyout core={core} taskRunner={taskRunner} closeFlyout={closeFlyout} />
+  ),
 });

@@ -7,8 +7,11 @@
 
 import type { DataViewsServerPluginStart } from '@kbn/data-views-plugin/server';
 import type { IsomerPluginStart } from '@kbn/isomer-plugin/server';
+import type { TaskRunnerPocServerStart } from '@kbn/task-runner-poc-plugin/server';
 
 export interface IsomerDashboardsStartDeps {
   isomer: IsomerPluginStart;
   dataViews: DataViewsServerPluginStart;
+  /** Draws a dashboard on the multi-tenant task runner instead of in Kibana, when enabled. */
+  taskRunnerPoc?: TaskRunnerPocServerStart;
 }
